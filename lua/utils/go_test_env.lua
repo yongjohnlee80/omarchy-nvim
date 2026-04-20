@@ -19,6 +19,7 @@
 ---@field config_name? string        Select a launch config by `name`. Nil → first matching type=go, mode=test entry.
 ---@field notify_level? integer      Minimum level for notifications (vim.log.levels). Default: INFO.
 ---@field expand_env_values? boolean Run vim.fn.expand() on inline `env` values too. Default: false (avoids mangling values with $ chars).
+---@field default_build_flags? string Pre-filled value for the buildFlags prompt in M.create_debug_entry(). Default: "-buildvcs=false" (Go embeds git metadata by default, which breaks in bare+worktree setups where `git status` can fail from a worktree cwd).
 
 ---@class GoTestEnv.Result
 ---@field name? string
@@ -40,6 +41,7 @@ local defaults = {
   config_name = nil,
   notify_level = vim.log.levels.INFO,
   expand_env_values = false,
+  default_build_flags = "-buildvcs=false",
 }
 
 ---@type GoTestEnv.Opts
@@ -457,17 +459,6 @@ function M.debug_main(override_path)
   end, "debug")
 end
 
--- Scan the first 20 lines for `package main`. Idiomatic Go puts the
--- package declaration at the top, so this catches 99.9% of cases without
--- loading treesitter or a full parser.
-local function is_main_package(bufnr)
-  local n = math.min(20, vim.api.nvim_buf_line_count(bufnr))
-  for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, n, false)) do
-    if line:match("^%s*package%s+main%s*$") then return true end
-  end
-  return false
-end
-
 -- Walk up looking for the project root (where `.bare/` or `.git/` sits).
 -- Returns the directory path, or nil if neither is found. Same stop rules
 -- as resolve_path(), but returns the directory instead of a launch.json.
@@ -626,17 +617,19 @@ end
 --- Replaces any existing entry with the same `name`; appends otherwise.
 function M.create_debug_entry()
   local bufnr = vim.api.nvim_get_current_buf()
-  if vim.bo[bufnr].filetype ~= "go" then
-    notify("current buffer is not a Go file", vim.log.levels.ERROR)
-    return
-  end
-  if not is_main_package(bufnr) then
-    notify("current buffer is not a 'package main'", vim.log.levels.ERROR)
-    return
-  end
   local file_path = vim.api.nvim_buf_get_name(bufnr)
+  local ft = vim.bo[bufnr].filetype
+  local where = ("[buf %d, ft=%s, path=%s]"):format(
+    bufnr, ft == "" and "<none>" or ft,
+    file_path == "" and "<unnamed>" or file_path
+  )
+
+  if ft ~= "go" then
+    notify("current buffer is not a Go file " .. where, vim.log.levels.ERROR)
+    return
+  end
   if file_path == "" then
-    notify("buffer has no file on disk", vim.log.levels.ERROR)
+    notify("buffer has no file on disk " .. where, vim.log.levels.ERROR)
     return
   end
 
@@ -674,6 +667,7 @@ function M.create_debug_entry()
 
         vim.ui.input({
           prompt = "buildFlags (blank = none, e.g. -tags=debug): ",
+          default = opts.default_build_flags or "",
         }, function(build_flags)
           if build_flags == nil then return end
 
