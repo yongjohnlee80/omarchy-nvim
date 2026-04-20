@@ -85,6 +85,9 @@ return {
       { "<leader>da", function() require("dap-go").attach() end,       desc = "Debug: Attach to Process (delve)", ft = "go" },
       -- Merges launch.json (buildFlags/env/envFile) into the test config on first use per session.
       { "<leader>dt", function() require("utils.go_test_env").debug_test() end, desc = "Debug: Debug Go Test (+launch.json)", ft = "go" },
+      -- Launch a main-program mode=debug config from launch.json. Picker on
+      -- first use (multi-entry-point repos), session-cached until reload.
+      { "<leader>dm", function() require("utils.go_test_env").debug_main() end, desc = "Debug: Debug Main (+launch.json)", ft = "go" },
       { "<leader>dT", function() require("dap").run_last() end,        desc = "Debug: Run Last Debug Session",    ft = "go" },
       -- Reload launch.json after editing it mid-session.
       { "<leader>dL", function() require("utils.go_test_env").reload() end,  desc = "Debug: Reload launch.json cache", ft = "go" },

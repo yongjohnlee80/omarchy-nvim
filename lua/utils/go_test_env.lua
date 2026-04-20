@@ -21,6 +21,14 @@
 ---@field expand_env_values? boolean Run vim.fn.expand() on inline `env` values too. Default: false (avoids mangling values with $ chars).
 
 ---@class GoTestEnv.Result
+---@field name? string
+---@field type? string
+---@field request? string
+---@field mode? string
+---@field program? string
+---@field cwd? string
+---@field output? string
+---@field args? string[]
 ---@field buildFlags? string
 ---@field env? table<string,string>
 
@@ -159,15 +167,41 @@ end
 
 ---@param override string?
 ---@return string?
+-- Walk up from the global cwd looking for a launch.json, one level at a
+-- time. Stops at project boundary markers so we never slurp an unrelated
+-- launch.json from above the project:
+--   * `.bare/` dir  -- bare+worktree `.bare`-style container
+--   * `.git/`  dir  -- regular repo root OR `bare_dir=".git"` convention
+-- Each level checks for launch.json FIRST, then the stop rule, so a
+-- `launch.json` sitting next to `.bare/` or `.git/` is still picked up.
+-- This is how you share one launch.json across worktrees: park it at the
+-- project root (next to the bare) and every worktree picks it up via the
+-- walk.
 local function resolve_path(override)
   if override and override ~= "" then
     return vim.fn.fnamemodify(override, ":p")
   end
-  local cwd = global_cwd()
-  for _, rel in ipairs(opts.launch_paths or defaults.launch_paths) do
-    local p = cwd .. "/" .. rel
-    if vim.fn.filereadable(p) == 1 then return p end
+
+  local launch_paths = opts.launch_paths or defaults.launch_paths
+  local cur = global_cwd()
+  local seen = {}
+
+  while cur and cur ~= "" and not seen[cur] do
+    seen[cur] = true
+
+    for _, rel in ipairs(launch_paths) do
+      local p = cur .. "/" .. rel
+      if vim.fn.filereadable(p) == 1 then return p end
+    end
+
+    if vim.fn.isdirectory(cur .. "/.bare") == 1 then break end
+    if vim.fn.isdirectory(cur .. "/.git") == 1 then break end
+
+    local parent = vim.fn.fnamemodify(cur, ":h")
+    if parent == cur or parent == "" then break end
+    cur = parent
   end
+
   return nil
 end
 
@@ -189,12 +223,43 @@ end
 
 ---@param raw table
 ---@return GoTestEnv.Result
+-- Produce a full dap-ready config from a launch.json entry:
+--   * Identity fields (name/type/request/mode) forwarded verbatim.
+--   * Path-like fields (program/cwd/output/args) get `${workspaceFolder}` +
+--     shell substitution. Each new worktree sees its own workspaceFolder
+--     because the value is resolved from the current cwd at load time.
+--   * buildFlags and env values only get `${workspaceFolder}` substitution
+--     (no shell) -- protects strings containing literal `$` like bcrypt
+--     hashes or PG connection passwords.
+-- For test configs, dap-go.debug_test only cares about buildFlags + env,
+-- but carrying the full config through is harmless (extra fields ignored)
+-- and keeps M.debug_main's `dap.run(config)` path simple.
 local function normalize(raw)
   ---@type GoTestEnv.Result
   local out = {}
+
+  out.name = raw.name
+  out.type = raw.type
+  out.request = raw.request
+  out.mode = raw.mode
+
+  for _, k in ipairs({ "program", "cwd", "output" }) do
+    if type(raw[k]) == "string" and raw[k] ~= "" then
+      out[k] = sub_path(raw[k])
+    end
+  end
+
+  if type(raw.args) == "table" then
+    out.args = {}
+    for _, a in ipairs(raw.args) do
+      table.insert(out.args, sub_path(a))
+    end
+  end
+
   if type(raw.buildFlags) == "string" and raw.buildFlags ~= "" then
     out.buildFlags = sub_workspace(raw.buildFlags)
   end
+
   local merged = {}
   if type(raw.envFile) == "string" and raw.envFile ~= "" then
     local path = sub_path(raw.envFile)
@@ -371,6 +436,25 @@ function M.debug_test(override_path)
     if not config then return end
     dap_go.debug_test(config)
   end, "test")
+end
+
+--- Launch a main-program debug session using a `mode=debug` config from
+--- launch.json. Uses the same picker + session-cache flow as debug_test,
+--- keyed separately so your "which test?" and "which main?" picks don't
+--- stomp each other. If no matching config exists, notifies and exits --
+--- falls back to nothing (use <leader>dc / dap.continue() for the stock
+--- dap-go built-ins if you want those).
+---@param override_path string?
+function M.debug_main(override_path)
+  local ok, dap = pcall(require, "dap")
+  if not ok then
+    notify("require('dap') failed — nvim-dap is required", vim.log.levels.ERROR)
+    return
+  end
+  M.load(override_path, function(config)
+    if not config or not next(config) then return end
+    dap.run(config)
+  end, "debug")
 end
 
 --- Configure module behavior. Merges over defaults; invalidates caches.
