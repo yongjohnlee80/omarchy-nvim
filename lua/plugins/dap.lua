@@ -88,6 +88,9 @@ return {
       -- Launch a main-program mode=debug config from launch.json. Picker on
       -- first use (multi-entry-point repos), session-cached until reload.
       { "<leader>dm", function() require("utils.go_test_env").debug_main() end, desc = "Debug: Debug Main (+launch.json)", ft = "go" },
+      -- Scaffold a new mode=debug entry for the current main package into
+      -- the project-root launch.json. Prompts for name/args/envFile/buildFlags.
+      { "<leader>dn", function() require("utils.go_test_env").create_debug_entry() end, desc = "Debug: New Main entry (+launch.json)", ft = "go" },
       { "<leader>dT", function() require("dap").run_last() end,        desc = "Debug: Run Last Debug Session",    ft = "go" },
       -- Reload launch.json after editing it mid-session.
       { "<leader>dL", function() require("utils.go_test_env").reload() end,  desc = "Debug: Reload launch.json cache", ft = "go" },

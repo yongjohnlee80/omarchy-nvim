@@ -457,6 +457,261 @@ function M.debug_main(override_path)
   end, "debug")
 end
 
+-- Scan the first 20 lines for `package main`. Idiomatic Go puts the
+-- package declaration at the top, so this catches 99.9% of cases without
+-- loading treesitter or a full parser.
+local function is_main_package(bufnr)
+  local n = math.min(20, vim.api.nvim_buf_line_count(bufnr))
+  for _, line in ipairs(vim.api.nvim_buf_get_lines(bufnr, 0, n, false)) do
+    if line:match("^%s*package%s+main%s*$") then return true end
+  end
+  return false
+end
+
+-- Walk up looking for the project root (where `.bare/` or `.git/` sits).
+-- Returns the directory path, or nil if neither is found. Same stop rules
+-- as resolve_path(), but returns the directory instead of a launch.json.
+local function find_project_root(start)
+  local cur = start or global_cwd()
+  local seen = {}
+  while cur and cur ~= "" and not seen[cur] do
+    seen[cur] = true
+    if vim.fn.isdirectory(cur .. "/.bare") == 1 then return cur end
+    if vim.fn.isdirectory(cur .. "/.git") == 1 then return cur end
+    local parent = vim.fn.fnamemodify(cur, ":h")
+    if parent == cur or parent == "" then break end
+    cur = parent
+  end
+  return nil
+end
+
+-- Naive space-split: honors simple double-quoted tokens ("foo bar" -> "foo
+-- bar"), strips the quotes. Doesn't handle escaped quotes, backticks, or
+-- shell-style single quotes -- complex args should be edited directly in
+-- launch.json.
+local function split_args(s)
+  local out = {}
+  local i, n = 1, #s
+  while i <= n do
+    while i <= n and s:sub(i, i):match("%s") do i = i + 1 end
+    if i > n then break end
+    local c = s:sub(i, i)
+    if c == '"' then
+      local close = s:find('"', i + 1, true)
+      if close then
+        table.insert(out, s:sub(i + 1, close - 1))
+        i = close + 1
+      else
+        table.insert(out, s:sub(i + 1))
+        break
+      end
+    else
+      local start = i
+      while i <= n and not s:sub(i, i):match("%s") do i = i + 1 end
+      table.insert(out, s:sub(start, i - 1))
+    end
+  end
+  return out
+end
+
+-- JSON field-order priority for launch.json. Keys present in this list
+-- render in this order; unknown keys fall to the end sorted alphabetically.
+-- Matches the order VSCode + most handwritten launch.json files use.
+local JSON_FIELD_PRIORITY = {
+  "version", "configurations",
+  "name", "type", "request", "mode",
+  "program", "cwd", "args", "env", "envFile",
+  "buildFlags", "output",
+}
+
+local function cmp_keys(a, b)
+  local idx = {}
+  for i, k in ipairs(JSON_FIELD_PRIORITY) do idx[k] = i end
+  local ia, ib = idx[a], idx[b]
+  if ia and ib then return ia < ib end
+  if ia then return true end
+  if ib then return false end
+  return a < b
+end
+
+---@param value any
+---@param indent string?
+---@return string
+local function encode_pretty(value, indent)
+  indent = indent or ""
+  local next_indent = indent .. "  "
+
+  if type(value) == "table" then
+    if vim.islist(value) then
+      if #value == 0 then return "[]" end
+      local parts = {}
+      for _, v in ipairs(value) do
+        table.insert(parts, next_indent .. encode_pretty(v, next_indent))
+      end
+      return "[\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "]"
+    end
+    local keys = {}
+    for k in pairs(value) do
+      if type(k) == "string" then table.insert(keys, k) end
+    end
+    if #keys == 0 then return "{}" end
+    table.sort(keys, cmp_keys)
+    local parts = {}
+    for _, k in ipairs(keys) do
+      table.insert(parts,
+        next_indent .. vim.json.encode(k) .. ": " ..
+        encode_pretty(value[k], next_indent))
+    end
+    return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
+  elseif type(value) == "string" then
+    return vim.json.encode(value)
+  elseif type(value) == "number" or type(value) == "boolean" then
+    return tostring(value)
+  end
+  return "null"
+end
+
+-- Persist `data` to <project-root>/.vscode/launch.json, creating .vscode/ if
+-- needed. Caches + session picks are cleared so the very next load() sees
+-- the new entry.
+local function persist_launch(root, data)
+  local vscode_dir = root .. "/.vscode"
+  vim.fn.mkdir(vscode_dir, "p")
+  local path = vscode_dir .. "/launch.json"
+  local f, err = io.open(path, "w")
+  if not f then
+    notify("could not write " .. path .. ": " .. tostring(err), vim.log.levels.ERROR)
+    return false
+  end
+  f:write(encode_pretty(data) .. "\n")
+  f:close()
+  cache = nil
+  session_pick = {}
+  notify("wrote " .. path)
+  return true
+end
+
+-- Read the existing launch.json at root/.vscode/launch.json (or /launch.json
+-- if .vscode is absent), returning the parsed table. Fresh `{version, cfgs}`
+-- scaffold if the file is missing or unparseable.
+local function load_or_new_launch(root)
+  local fresh = { version = "0.2.0", configurations = {} }
+  for _, rel in ipairs({ ".vscode/launch.json", "launch.json" }) do
+    local path = root .. "/" .. rel
+    if vim.fn.filereadable(path) == 1 then
+      local f = io.open(path, "r")
+      if f then
+        local content = f:read("*a")
+        f:close()
+        local parsed = parse_launchjs(content)
+        if parsed then
+          if type(parsed.configurations) ~= "table" then
+            parsed.configurations = {}
+          end
+          return parsed
+        end
+      end
+    end
+  end
+  return fresh
+end
+
+--- Scaffold a new `mode=debug` launch.json entry from the current buffer,
+--- written to <project-root>/.vscode/launch.json (walks up from cwd,
+--- stopping at .bare/ or .git/). Program path is auto-derived from the
+--- buffer's file directory, relative to the cwd, prefixed with
+--- `${workspaceFolder}` so worktrees share the same entry. Prompts for
+--- name, args, envFile, buildFlags.
+---
+--- Replaces any existing entry with the same `name`; appends otherwise.
+function M.create_debug_entry()
+  local bufnr = vim.api.nvim_get_current_buf()
+  if vim.bo[bufnr].filetype ~= "go" then
+    notify("current buffer is not a Go file", vim.log.levels.ERROR)
+    return
+  end
+  if not is_main_package(bufnr) then
+    notify("current buffer is not a 'package main'", vim.log.levels.ERROR)
+    return
+  end
+  local file_path = vim.api.nvim_buf_get_name(bufnr)
+  if file_path == "" then
+    notify("buffer has no file on disk", vim.log.levels.ERROR)
+    return
+  end
+
+  local root = find_project_root(global_cwd())
+  if not root then
+    notify(
+      "no project root (.bare/ or .git/) found walking up from cwd",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  local pkg_dir = vim.fn.fnamemodify(file_path, ":p:h")
+  local cwd = global_cwd()
+  local program_ref = "${workspaceFolder}"
+  if pkg_dir:sub(1, #cwd) == cwd and #pkg_dir > #cwd then
+    program_ref = "${workspaceFolder}/" .. pkg_dir:sub(#cwd + 2)
+  end
+  local pkg_name = vim.fn.fnamemodify(pkg_dir, ":t")
+  local suggested = "Go: Debug Main (" .. pkg_name .. ")"
+
+  vim.ui.input({ prompt = "Config name: ", default = suggested }, function(name)
+    if not name or vim.trim(name) == "" then return end
+    name = vim.trim(name)
+
+    vim.ui.input({
+      prompt = "Program args (space-separated, blank = none): ",
+    }, function(args_str)
+      if args_str == nil then return end
+
+      vim.ui.input({
+        prompt = "envFile path (blank = none): ",
+      }, function(envfile)
+        if envfile == nil then return end
+
+        vim.ui.input({
+          prompt = "buildFlags (blank = none, e.g. -tags=debug): ",
+        }, function(build_flags)
+          if build_flags == nil then return end
+
+          local entry = {
+            name = name,
+            type = "go",
+            request = "launch",
+            mode = "debug",
+            program = program_ref,
+          }
+          if args_str ~= "" then entry.args = split_args(args_str) end
+          if envfile ~= "" then entry.envFile = envfile end
+          if build_flags ~= "" then entry.buildFlags = build_flags end
+
+          local existing = load_or_new_launch(root)
+          local replaced = false
+          for i, c in ipairs(existing.configurations) do
+            if c.name == name then
+              existing.configurations[i] = entry
+              replaced = true
+              break
+            end
+          end
+          if not replaced then
+            table.insert(existing.configurations, entry)
+          end
+
+          if persist_launch(root, existing) then
+            notify(("%s entry '%s' (program=%s)"):format(
+              replaced and "replaced" or "added", name, program_ref
+            ))
+          end
+        end)
+      end)
+    end)
+  end)
+end
+
 --- Configure module behavior. Merges over defaults; invalidates caches.
 ---@param user_opts GoTestEnv.Opts?
 function M.setup(user_opts)
@@ -476,5 +731,9 @@ end, { desc = "Show the cached go-test-env config" })
 pcall(vim.api.nvim_create_user_command, "GoTestEnvPick", function(cmd)
   M.clear_pick(cmd.args ~= "" and cmd.args or nil)
 end, { nargs = "?", desc = "Clear the session pick (arg: 'test' or 'debug', default 'test')" })
+
+pcall(vim.api.nvim_create_user_command, "GoTestEnvNew", function()
+  M.create_debug_entry()
+end, { desc = "Scaffold a new mode=debug entry in project-root launch.json" })
 
 return M
