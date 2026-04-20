@@ -48,5 +48,5 @@
   "ts-comments.nvim": { "branch": "main", "commit": "123a9fb12e7229342f807ec9e6de478b1102b041" },
   "venv-selector.nvim": { "branch": "main", "commit": "bcb2f58533c59b01565285eba49693f00bc460f5" },
   "which-key.nvim": { "branch": "main", "commit": "3aab2147e74890957785941f0c1ad87d0a44c15a" },
-  "worktree.nvim": { "branch": "main", "commit": "4351afd8d447399f128f3d85c4dfe88ef567b8dd" }
+  "worktree.nvim": { "branch": "main", "commit": "7002c5825412f079ab79518df1638b64fb3695c1" }
 }
