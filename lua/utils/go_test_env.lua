@@ -37,8 +37,17 @@ local defaults = {
 ---@type GoTestEnv.Opts
 local opts = vim.deepcopy(defaults)
 
--- { path = string|nil, mtime = integer|nil, config = GoTestEnv.Result } | nil
+-- File-level cache of the PARSED launch.json (keyed by path + mtime). Holds
+-- the raw table so we can re-filter on every load() without re-reading disk.
+-- { path = string|nil, mtime = integer|nil, parsed = table|nil } | nil
 local cache = nil
+
+-- Session-level remembered pick, keyed by mode ("test" / "debug"). The first
+-- time the user picks from a multi-config launch.json, the choice sticks
+-- until M.reload() or M.clear_pick() clears it. Survives edits to the file
+-- as long as the same `name` still exists; cleared alongside file cache on
+-- reload.
+local session_pick = {}
 
 local uv = vim.uv or vim.loop
 
@@ -163,18 +172,19 @@ local function resolve_path(override)
 end
 
 ---@param parsed table
----@return table|nil
-local function pick_config(parsed)
+---@param mode string  "test" or "debug"
+---@return table[]    all matching configs, in file order
+local function filter_configs(parsed, mode)
   if type(parsed) ~= "table" or type(parsed.configurations) ~= "table" then
-    return nil
+    return {}
   end
-  local name = opts.config_name
+  local out = {}
   for _, c in ipairs(parsed.configurations) do
-    if c.type == "go" and c.mode == "test" and (not name or c.name == name) then
-      return c
+    if c.type == "go" and c.mode == mode then
+      table.insert(out, c)
     end
   end
-  return nil
+  return out
 end
 
 ---@param raw table
@@ -210,32 +220,31 @@ local function mtime_of(path)
   return s and s.mtime and s.mtime.sec or nil
 end
 
---- Load (and cache) a normalized config from launch.json. The cache invalidates
---- automatically when launch.json's mtime changes; it does NOT watch the
---- referenced envFile — use `:GoTestEnvReload` (or `M.reload()`) after editing it.
+--- Ensure launch.json is parsed and in `cache.parsed`. Returns true on
+--- success; on failure, notifies and returns false.
 ---@param override_path string?
----@return GoTestEnv.Result
-function M.load(override_path)
+---@return boolean
+local function ensure_parsed(override_path)
   local path = resolve_path(override_path)
   if not path then
     notify(
       "no launch.json found (searched " .. table.concat(opts.launch_paths or defaults.launch_paths, ", ") .. ")",
       vim.log.levels.WARN
     )
-    cache = { path = nil, mtime = nil, config = {} }
-    return cache.config
+    cache = { path = nil, mtime = nil, parsed = nil }
+    return false
   end
 
   local mtime = mtime_of(path)
-  if cache and cache.path == path and cache.mtime == mtime and not override_path then
-    return cache.config
+  if cache and cache.path == path and cache.mtime == mtime and cache.parsed and not override_path then
+    return true
   end
 
   local f = io.open(path, "r")
   if not f then
     notify("could not read " .. path, vim.log.levels.ERROR)
-    cache = { path = path, mtime = mtime, config = {} }
-    return cache.config
+    cache = { path = path, mtime = mtime, parsed = nil }
+    return false
   end
   local content = f:read("*a")
   f:close()
@@ -243,37 +252,90 @@ function M.load(override_path)
   local parsed, err = parse_launchjs(content)
   if not parsed then
     notify("parse failed: " .. tostring(err), vim.log.levels.ERROR)
-    cache = { path = path, mtime = mtime, config = {} }
-    return cache.config
+    cache = { path = path, mtime = mtime, parsed = nil }
+    return false
   end
 
-  local raw = pick_config(parsed)
-  if not raw then
-    local suffix = opts.config_name and (" matching name=" .. opts.config_name) or ""
-    notify("no Go test config" .. suffix .. " in " .. path, vim.log.levels.WARN)
-    cache = { path = path, mtime = mtime, config = {} }
-    return cache.config
-  end
-
-  local config = normalize(raw)
-  cache = { path = path, mtime = mtime, config = config }
-
-  local parts = {}
-  if config.buildFlags then parts[#parts + 1] = "buildFlags=" .. config.buildFlags end
-  if config.env then parts[#parts + 1] = "env=" .. tostring(vim.tbl_count(config.env)) .. " keys" end
-  notify(
-    ("loaded %s%s"):format(path, #parts > 0 and " (" .. table.concat(parts, ", ") .. ")" or ""),
-    vim.log.levels.INFO
-  )
-  return config
+  cache = { path = path, mtime = mtime, parsed = parsed }
+  return true
 end
 
---- Clear the cache and immediately reload.
+--- Deliver the matching config to `callback(normalized_or_nil)`. Handles the
+--- resolution cascade: config_name hard pin → session pick → single match →
+--- `vim.ui.select` prompt. Calls back with nil if the user cancels or no
+--- matching config exists.
+---@param opts_local { mode: string }
+---@param callback fun(config: GoTestEnv.Result?)
+local function resolve(opts_local, callback)
+  local matches = filter_configs(cache and cache.parsed or {}, opts_local.mode)
+  if #matches == 0 then
+    notify(
+      ("no type=go mode=%s configs in %s"):format(opts_local.mode, cache and cache.path or "<none>"),
+      vim.log.levels.WARN
+    )
+    callback(nil)
+    return
+  end
+
+  -- config_name (from setup) wins over session pick.
+  local pinned = opts.config_name or session_pick[opts_local.mode]
+  if pinned then
+    for _, c in ipairs(matches) do
+      if c.name == pinned then callback(normalize(c)); return end
+    end
+    -- Named pick no longer present — fall through to prompt / single-match.
+    if session_pick[opts_local.mode] then session_pick[opts_local.mode] = nil end
+  end
+
+  if #matches == 1 then
+    callback(normalize(matches[1]))
+    return
+  end
+
+  vim.ui.select(matches, {
+    prompt = ("Pick a %s config:"):format(opts_local.mode),
+    format_item = function(c) return c.name end,
+  }, function(choice)
+    if not choice then callback(nil); return end
+    session_pick[opts_local.mode] = choice.name
+    notify(("picked '%s' (cached for this session; :GoTestEnvPick to reset)"):format(choice.name))
+    callback(normalize(choice))
+  end)
+end
+
+--- Load a launch.json config asynchronously. Parses (and caches) the file,
+--- then resolves a matching config via: config_name → session pick → single
+--- match → interactive picker. Callback fires with the normalized config, or
+--- nil if the user cancelled or none matched.
+--- The file cache invalidates on mtime change; it does NOT watch the
+--- referenced envFile — use `:GoTestEnvReload` (or `M.reload()`) after editing it.
 ---@param override_path string?
----@return GoTestEnv.Result
+---@param callback fun(config: GoTestEnv.Result?)
+---@param mode string? "test" (default) or "debug"
+function M.load(override_path, callback, mode)
+  if not ensure_parsed(override_path) then callback({}) ; return end
+  resolve({ mode = mode or "test" }, function(config)
+    callback(config or {})
+  end)
+end
+
+--- Clear the file cache AND the session picks, then trigger a fresh load.
+--- Reason for clearing picks: the most common reason to reload is "I edited
+--- launch.json" — which might have renamed / removed the pinned config.
+---@param override_path string?
 function M.reload(override_path)
   cache = nil
-  return M.load(override_path)
+  session_pick = {}
+  M.load(override_path, function() end)
+end
+
+--- Clear the session pick for `mode` (defaults to "test") without re-reading
+--- launch.json. Next `debug_test` / `debug_main` will prompt again if the
+--- file has >1 matching config.
+---@param mode string?
+function M.clear_pick(mode)
+  session_pick[mode or "test"] = nil
+  notify(("cleared session pick (%s)"):format(mode or "test"))
 end
 
 --- Report what's currently cached.
@@ -282,13 +344,22 @@ function M.status()
     notify("not yet loaded", vim.log.levels.INFO)
     return
   end
+  local picks = {}
+  for k, v in pairs(session_pick) do
+    picks[#picks + 1] = k .. "=" .. v
+  end
   notify(
-    ("cached from %s: %s"):format(cache.path or "<none>", vim.inspect(cache.config)),
+    ("cached from %s; session picks: %s"):format(
+      cache.path or "<none>",
+      #picks > 0 and table.concat(picks, ", ") or "<none>"
+    ),
     vim.log.levels.INFO
   )
 end
 
---- Run the test under the cursor with the cached launch.json config merged in.
+--- Run the test under the cursor with the launch.json config merged in.
+--- Prompts once per session if multiple test configs exist; remembers
+--- the pick until :GoTestEnvReload or :GoTestEnvPick clears it.
 ---@param override_path string?
 function M.debug_test(override_path)
   local ok, dap_go = pcall(require, "dap-go")
@@ -296,22 +367,30 @@ function M.debug_test(override_path)
     notify("require('dap-go') failed — install nvim-dap-go", vim.log.levels.ERROR)
     return
   end
-  dap_go.debug_test(M.load(override_path))
+  M.load(override_path, function(config)
+    if not config then return end
+    dap_go.debug_test(config)
+  end, "test")
 end
 
---- Configure module behavior. Merges over defaults; invalidates the cache.
+--- Configure module behavior. Merges over defaults; invalidates caches.
 ---@param user_opts GoTestEnv.Opts?
 function M.setup(user_opts)
   opts = vim.tbl_deep_extend("force", defaults, user_opts or {})
   cache = nil
+  session_pick = {}
 end
 
 pcall(vim.api.nvim_create_user_command, "GoTestEnvReload", function(cmd)
   M.reload(cmd.args ~= "" and cmd.args or nil)
-end, { nargs = "?", complete = "file", desc = "Reload go-test-env launch.json cache" })
+end, { nargs = "?", complete = "file", desc = "Reload go-test-env launch.json + clear session picks" })
 
 pcall(vim.api.nvim_create_user_command, "GoTestEnvStatus", function()
   M.status()
 end, { desc = "Show the cached go-test-env config" })
+
+pcall(vim.api.nvim_create_user_command, "GoTestEnvPick", function(cmd)
+  M.clear_pick(cmd.args ~= "" and cmd.args or nil)
+end, { nargs = "?", desc = "Clear the session pick (arg: 'test' or 'debug', default 'test')" })
 
 return M
