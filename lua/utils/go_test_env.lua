@@ -607,15 +607,30 @@ local function load_or_new_launch(root)
   return fresh
 end
 
---- Scaffold a new `mode=debug` launch.json entry from the current buffer,
---- written to <project-root>/.vscode/launch.json (walks up from cwd,
---- stopping at .bare/ or .git/). Program path is auto-derived from the
---- buffer's file directory, relative to the cwd, prefixed with
---- `${workspaceFolder}` so worktrees share the same entry. Prompts for
---- name, args, envFile, buildFlags.
----
---- Replaces any existing entry with the same `name`; appends otherwise.
-function M.create_debug_entry()
+-- Parse an inline `KEY=VAL;KEY=VAL` string into an env table. Semicolons
+-- are the separator (works in a one-line prompt); whitespace around keys
+-- and around `=` is trimmed. Values pass through verbatim -- literal `$`,
+-- quotes, and passwords containing `=` after the first one all survive.
+local function parse_inline_env(s)
+  local out = {}
+  for pair in s:gmatch("[^;]+") do
+    pair = vim.trim(pair)
+    if pair ~= "" then
+      local k, v = pair:match("^([^=]+)=(.*)$")
+      if k then out[vim.trim(k)] = v end
+    end
+  end
+  return out
+end
+
+-- Shared scaffolder for both mode=debug and mode=test entries. The prompts
+-- that differ by mode:
+--   * `args` is prompted for debug only. Tests get their `-test.run` args
+--     filled in at runtime by dap-go based on cursor position.
+--   * Suggested name reflects mode ("Debug Main" vs "Debug Test").
+-- Everything else (name, env inline, envFile, buildFlags, project-root
+-- resolution, program path derivation, replace-by-name) is shared.
+local function create_entry(mode)
   local bufnr = vim.api.nvim_get_current_buf()
   local file_path = vim.api.nvim_buf_get_name(bufnr)
   local ft = vim.bo[bufnr].filetype
@@ -649,61 +664,257 @@ function M.create_debug_entry()
     program_ref = "${workspaceFolder}/" .. pkg_dir:sub(#cwd + 2)
   end
   local pkg_name = vim.fn.fnamemodify(pkg_dir, ":t")
-  local suggested = "Go: Debug Main (" .. pkg_name .. ")"
+  local kind_label = mode == "test" and "Test" or "Main"
+  local suggested = ("Go: Debug %s (%s)"):format(kind_label, pkg_name)
+
+  local function finish(entry)
+    local existing = load_or_new_launch(root)
+    local replaced = false
+    for i, c in ipairs(existing.configurations) do
+      if c.name == entry.name then
+        existing.configurations[i] = entry
+        replaced = true
+        break
+      end
+    end
+    if not replaced then
+      table.insert(existing.configurations, entry)
+    end
+    if persist_launch(root, existing) then
+      notify(("%s entry '%s' (mode=%s, program=%s)"):format(
+        replaced and "replaced" or "added", entry.name, mode, entry.program
+      ))
+    end
+  end
 
   vim.ui.input({ prompt = "Config name: ", default = suggested }, function(name)
     if not name or vim.trim(name) == "" then return end
     name = vim.trim(name)
 
-    vim.ui.input({
-      prompt = "Program args (space-separated, blank = none): ",
-    }, function(args_str)
-      if args_str == nil then return end
+    local entry = {
+      name = name,
+      type = "go",
+      request = "launch",
+      mode = mode,
+      program = program_ref,
+    }
 
+    local function prompt_env()
       vim.ui.input({
-        prompt = "envFile path (blank = none): ",
-      }, function(envfile)
-        if envfile == nil then return end
+        prompt = "env inline (KEY=VAL;KEY=VAL, blank = none): ",
+      }, function(env_str)
+        if env_str == nil then return end
+        if env_str ~= "" then
+          local parsed = parse_inline_env(env_str)
+          if next(parsed) then entry.env = parsed end
+        end
 
         vim.ui.input({
-          prompt = "buildFlags (blank = none, e.g. -tags=debug): ",
-          default = opts.default_build_flags or "",
-        }, function(build_flags)
-          if build_flags == nil then return end
-
-          local entry = {
-            name = name,
-            type = "go",
-            request = "launch",
-            mode = "debug",
-            program = program_ref,
-          }
-          if args_str ~= "" then entry.args = split_args(args_str) end
+          prompt = "envFile path (blank = none): ",
+        }, function(envfile)
+          if envfile == nil then return end
           if envfile ~= "" then entry.envFile = envfile end
-          if build_flags ~= "" then entry.buildFlags = build_flags end
 
-          local existing = load_or_new_launch(root)
-          local replaced = false
-          for i, c in ipairs(existing.configurations) do
-            if c.name == name then
-              existing.configurations[i] = entry
-              replaced = true
-              break
-            end
-          end
-          if not replaced then
-            table.insert(existing.configurations, entry)
-          end
-
-          if persist_launch(root, existing) then
-            notify(("%s entry '%s' (program=%s)"):format(
-              replaced and "replaced" or "added", name, program_ref
-            ))
-          end
+          vim.ui.input({
+            prompt = "buildFlags (blank = none, e.g. -tags=gold): ",
+            default = opts.default_build_flags or "",
+          }, function(build_flags)
+            if build_flags == nil then return end
+            if build_flags ~= "" then entry.buildFlags = build_flags end
+            finish(entry)
+          end)
         end)
       end)
-    end)
+    end
+
+    -- Tests don't prompt for args -- dap-go.debug_test() fills in
+    -- `-test.run ^TestName$` from the cursor at runtime, so pinning args
+    -- here would fight that.
+    if mode == "debug" then
+      vim.ui.input({
+        prompt = "Program args (space-separated, blank = none): ",
+      }, function(args_str)
+        if args_str == nil then return end
+        if args_str ~= "" then entry.args = split_args(args_str) end
+        prompt_env()
+      end)
+    else
+      prompt_env()
+    end
   end)
+end
+
+--- Scaffold a new `mode=debug` launch.json entry from the current buffer.
+--- Prompts: name, args, env (inline), envFile, buildFlags.
+function M.create_debug_entry()
+  create_entry("debug")
+end
+
+--- Scaffold a new `mode=test` launch.json entry from the current buffer.
+--- Prompts: name, env (inline), envFile, buildFlags. No args prompt --
+--- dap-go.debug_test() inserts `-test.run ^TestName$` from cursor at run time.
+function M.create_test_entry()
+  create_entry("test")
+end
+
+-- Run `git rev-parse --path-format=absolute --git-common-dir` at `path`.
+-- Returns the absolute path to the common dir (bare or .git/) or nil when
+-- `path` is not inside a git repo.
+local function git_common_dir(path)
+  local res = vim.system(
+    { "git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir" },
+    { text = true }
+  ):wait()
+  if res.code ~= 0 then return nil end
+  return ((res.stdout or ""):gsub("%s+$", ""))
+end
+
+-- Parse a `.git` gitfile and return the resolved gitdir path (absolute) and
+-- whether it actually exists on disk. Returns (nil, nil) for anything that
+-- isn't a parseable gitfile (wrong format, unreadable, etc.).
+local function parse_gitfile(path)
+  local f = io.open(path, "r")
+  if not f then return nil, nil end
+  local content = f:read("*a") or ""
+  f:close()
+  local gitdir = content:match("^gitdir:%s*(.-)%s*$")
+  if not gitdir then return nil, nil end
+  if not gitdir:match("^/") then
+    gitdir = vim.fn.fnamemodify(path, ":h") .. "/" .. gitdir
+  end
+  return gitdir, vim.fn.isdirectory(gitdir) == 1
+end
+
+-- Walk up from `start` looking for `go.mod`. Returns nil if not inside a Go
+-- module.
+local function find_module_root(start)
+  local cur = start
+  local seen = {}
+  while cur and cur ~= "" and not seen[cur] do
+    seen[cur] = true
+    if vim.fn.filereadable(cur .. "/go.mod") == 1 then return cur end
+    local parent = vim.fn.fnamemodify(cur, ":h")
+    if parent == cur or parent == "" then break end
+    cur = parent
+  end
+  return nil
+end
+
+-- Call `git -C path status --porcelain` and return (ok, exit_code, msg).
+-- `msg` is the first line of stderr when the call fails.
+local function git_status_check(path)
+  local res =
+    vim.system({ "git", "-C", path, "status", "--porcelain" }, { text = true }):wait()
+  if res.code == 0 then return true, 0, nil end
+  local stderr = res.stderr or ""
+  local first = stderr:match("([^\n]+)") or "(no stderr)"
+  return false, res.code, first
+end
+
+--- Report state relevant to the debug flow: which launch.json will be used,
+--- what the project root is, whether the cwd's .git is healthy, go-module
+--- location, and which configs the current launch.json exposes. Intended to
+--- be run on-demand when something's off -- never fires on the hot path.
+function M.doctor()
+  local cwd = global_cwd()
+  local lines = { "go-test-env doctor", "──────────────────" }
+  local add = function(k, v) lines[#lines + 1] = ("%-18s %s"):format(k .. ":", v) end
+
+  local lj = resolve_path(nil)
+  add("launch.json", lj or "<not found via upward walk>")
+
+  local root = find_project_root(cwd)
+  local root_marker = "<none>"
+  if root then
+    if vim.fn.isdirectory(root .. "/.bare") == 1 then
+      root_marker = ".bare/"
+    elseif vim.fn.isdirectory(root .. "/.git") == 1 then
+      -- Distinguish bare .git/ from regular .git/ for clarity.
+      local bare = vim.system(
+        { "git", "-C", root .. "/.git", "rev-parse", "--is-bare-repository" },
+        { text = true }
+      ):wait()
+      root_marker = (vim.trim(bare.stdout or "") == "true")
+        and ".git/ (bare)" or ".git/ (regular repo)"
+    end
+  end
+  add("project root", root and (root .. "  [" .. root_marker .. "]") or "<not found>")
+  add("cwd", cwd)
+
+  local cwd_git = cwd .. "/.git"
+  local git_kind = "<absent>"
+  if vim.fn.isdirectory(cwd_git) == 1 then
+    git_kind = "directory"
+  elseif vim.fn.filereadable(cwd_git) == 1 then
+    local target, ok = parse_gitfile(cwd_git)
+    if target then
+      git_kind = ("gitfile → %s  [%s]"):format(target, ok and "OK" or "MISSING")
+    else
+      git_kind = "gitfile (unparseable)"
+    end
+  end
+  add("cwd .git", git_kind)
+
+  local ok, code, msg = git_status_check(cwd)
+  add("git status", ok and "OK" or ("exit %d -- %s"):format(code, msg))
+
+  local common = git_common_dir(cwd)
+  add("git common dir", common or "<not in a git repo>")
+
+  local module_root = find_module_root(cwd)
+  add(
+    "go module root",
+    module_root and (module_root .. "  [go.mod present]") or "<no go.mod found>"
+  )
+
+  -- List configs from launch.json + mark the session picks.
+  if lj and ensure_parsed(nil) and cache and cache.parsed then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "Configs:"
+    for _, mode in ipairs({ "test", "debug" }) do
+      local matches = filter_configs(cache.parsed, mode)
+      local header = ("  mode=%-5s (%d):"):format(mode, #matches)
+      if #matches == 0 then
+        lines[#lines + 1] = header .. " <none>"
+      else
+        for i, c in ipairs(matches) do
+          local marker = session_pick[mode] == c.name and "  [session pick]" or ""
+          lines[#lines + 1] = (i == 1 and header or "                   ")
+            .. " " .. (c.name or "<unnamed>") .. marker
+        end
+      end
+    end
+  end
+
+  notify(table.concat(lines, "\n"))
+end
+
+--- Run `git worktree repair` from the current repo's common dir. Fixes
+--- stale gitfile pointers in linked worktrees (the thing that breaks
+--- buildvcs when a worktree's `.git` no longer points to an existing
+--- gitdir). Safe: operates on the bare; read-only on worktree contents.
+function M.fix_worktree()
+  local cwd = global_cwd()
+  local common = git_common_dir(cwd)
+  if not common then
+    notify(
+      "not inside a git repo (cwd=" .. cwd .. "); cannot repair",
+      vim.log.levels.ERROR
+    )
+    return
+  end
+  local res = vim.system(
+    { "git", "-C", common, "worktree", "repair" }, { text = true }
+  ):wait()
+  if res.code ~= 0 then
+    notify(
+      "git worktree repair failed:\n" .. ((res.stdout or "") .. (res.stderr or "")),
+      vim.log.levels.ERROR
+    )
+    return
+  end
+  local out = vim.trim((res.stdout or "") .. (res.stderr or ""))
+  notify("git worktree repair @ " .. common .. (out ~= "" and ("\n" .. out) or ""))
 end
 
 --- Configure module behavior. Merges over defaults; invalidates caches.
@@ -726,8 +937,24 @@ pcall(vim.api.nvim_create_user_command, "GoTestEnvPick", function(cmd)
   M.clear_pick(cmd.args ~= "" and cmd.args or nil)
 end, { nargs = "?", desc = "Clear the session pick (arg: 'test' or 'debug', default 'test')" })
 
-pcall(vim.api.nvim_create_user_command, "GoTestEnvNew", function()
-  M.create_debug_entry()
-end, { desc = "Scaffold a new mode=debug entry in project-root launch.json" })
+pcall(vim.api.nvim_create_user_command, "GoTestEnvNew", function(cmd)
+  if cmd.args == "test" then
+    M.create_test_entry()
+  else
+    M.create_debug_entry()
+  end
+end, {
+  nargs = "?",
+  complete = function() return { "debug", "test" } end,
+  desc = "Scaffold a new launch.json entry (arg: 'debug' (default) or 'test')",
+})
+
+pcall(vim.api.nvim_create_user_command, "GoTestEnvDoctor", function()
+  M.doctor()
+end, { desc = "Diagnose launch.json / worktree / git state for debug flow" })
+
+pcall(vim.api.nvim_create_user_command, "GoTestEnvFix", function()
+  M.fix_worktree()
+end, { desc = "Run `git worktree repair` from the current repo's common dir" })
 
 return M

@@ -56,7 +56,10 @@ I've tried other setups. I've clicked through menus. I've dragged and dropped. I
 | `<leader>da` | Attach to a running process with delve |
 | `<leader>dt` | Debug the Go test under cursor (merges `launch.json`) |
 | `<leader>dm` | Debug a main program via `mode=debug` config in `launch.json` |
-| `<leader>dn` | Scaffold a new `mode=debug` entry into the project-root `launch.json` |
+| `<leader>dM` | Scaffold a new `mode=debug` entry into the project-root `launch.json` |
+| `<leader>dN` | Scaffold a new `mode=test` entry into the project-root `launch.json` |
+| `<leader>dD` | Doctor — report launch.json / worktree / git state |
+| `<leader>dF` | Fix worktree — `git worktree repair` from the bare |
 | `<leader>dT` | Re-run the last debug session |
 | `<leader>dL` | Reload the cached `launch.json` + clear session picks |
 

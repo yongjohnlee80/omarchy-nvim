@@ -109,11 +109,21 @@ return {
       -- first use (multi-entry-point repos), session-cached until reload.
       { "<leader>dm", function() require("utils.go_test_env").debug_main() end, desc = "Debug: Debug Main (+launch.json)", ft = "go" },
       -- Scaffold a new mode=debug entry for the current main package into
-      -- the project-root launch.json. Prompts for name/args/envFile/buildFlags.
-      { "<leader>dn", function() require("utils.go_test_env").create_debug_entry() end, desc = "Debug: New Main entry (+launch.json)", ft = "go" },
+      -- the project-root launch.json. Prompts for name/args/env/envFile/buildFlags.
+      -- Capital M to parallel lowercase `dm` (execute) vs `dM` (create).
+      { "<leader>dM", function() require("utils.go_test_env").create_debug_entry() end, desc = "Debug: New Main entry (+launch.json)", ft = "go" },
+      -- Parallel scaffolder for test configs. No args prompt -- dap-go
+      -- fills in `-test.run ^TestName$` from the cursor at run time.
+      { "<leader>dN", function() require("utils.go_test_env").create_test_entry() end, desc = "Debug: New Test entry (+launch.json)", ft = "go" },
       { "<leader>dT", function() require("dap").run_last() end,        desc = "Debug: Run Last Debug Session",    ft = "go" },
       -- Reload launch.json after editing it mid-session.
       { "<leader>dL", function() require("utils.go_test_env").reload() end,  desc = "Debug: Reload launch.json cache", ft = "go" },
+      -- Doctor: report launch.json, project root, cwd .git, git status,
+      -- go module root, available configs. Cheap to read on demand.
+      { "<leader>dD", function() require("utils.go_test_env").doctor() end,  desc = "Debug: Doctor (diagnose launch.json / worktree)", ft = "go" },
+      -- Fix: `git worktree repair` from the current repo's common dir.
+      -- Resolves stale gitfile pointers that break buildvcs.
+      { "<leader>dF", function() require("utils.go_test_env").fix_worktree() end, desc = "Debug: Fix worktree (git worktree repair)", ft = "go" },
     },
     opts = {
       delve = {
