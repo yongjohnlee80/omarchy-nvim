@@ -1,4 +1,24 @@
-# Johno's Neovim Config
+# Johno's Neovim Config → moved to AutoVim
+
+> ⚠ **This repo has moved.** Continuing development happens at **[yongjohnlee80/autovim](https://github.com/yongjohnlee80/autovim)**.
+>
+> Install from the new home:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/yongjohnlee80/autovim/main/install.sh | bash
+> ```
+>
+> If you have an existing clone pointed at this repo, update the remote:
+>
+> ```bash
+> cd ~/.config/nvim
+> git remote set-url origin git@github.com:yongjohnlee80/autovim.git
+> git fetch && git pull --ff-only
+> ```
+>
+> This repo is frozen at the last pre-rename state for reference and will be archived shortly. See the [AutoVim README](https://github.com/yongjohnlee80/autovim#readme) for current features, branch layout (`main` / `mac-os` / `omarchy`), and keymaps.
+
+---
 
 My Neovim configuration for [Omarchy](https://omarchy.com), purpose-built for TypeScript and Go development with Claude as a first-class citizen.
 
