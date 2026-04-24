@@ -2,6 +2,14 @@
 
 My Neovim configuration for [Omarchy](https://omarchy.com), purpose-built for TypeScript and Go development with Claude as a first-class citizen.
 
+> **You're on the `omarchy` branch.** This branch is tuned for Omarchy (Arch + Hyprland) and plugs into Omarchy's system theme so nvim auto-reloads its colorscheme whenever the OS theme changes. If you're not on Omarchy, pick the branch that matches your platform:
+>
+> | Branch | For | Theme handling |
+> |---|---|---|
+> | `omarchy` *(this one)* | Omarchy / Arch | `lua/plugins/theme.lua` is symlinked into `~/.config/omarchy/current/theme/neovim.lua`; `omarchy-theme-hotreload.lua` reloads the theme module on the `User LazyReload` autocmd Omarchy fires |
+> | `main` | Ubuntu, Windows, anything non-Omarchy | Static `theme.lua` + `<leader>ut` Snacks theme picker |
+> | `mac-os` | macOS | `main` plus macOS install notes and a bash-3.2-safe `bin/codex-nvim` (macOS ships GPL-2 bash 3.2) |
+
 ## Why This Exists
 
 Some people meditate. Some do yoga. I open Neovim, fire up Claude, and write Go and TypeScript until the world makes sense again. This is my happy place -- a terminal where keystrokes are cheap, feedback loops are tight, and the AI pair programmer never judges my variable names.
@@ -24,6 +32,7 @@ I've tried other setups. I've clicked through menus. I've dragged and dropped. I
 - **[glow.nvim](https://github.com/ellisonleao/glow.nvim)** -- floating markdown preview powered by `charmbracelet/glow`. `<leader>mp` on any `*.md` file, full ANSI colors because I forced `CLICOLOR_FORCE=1` so termenv stops stripping them
 - **Floating terminals via `snacks.terminal`** -- four toggleable floating terminals on `F1`–`F4`, each with its own persistent shell. Works from normal mode *and* terminal mode, so you can bounce between them without juggling `<C-\\><C-n>` every time
 - **Codex Neovim bundle** -- a repo-local Codex wrapper plus bundled `shell` and `toggle-diff-editor` skills. `F5` toggles slot-5 Codex (safe by default), `<A-s>` / `<A-t>` swap slot 5 into safe / trusted mode, and the launcher prints a short welcome note with the diff-editor hint
+- **Omarchy theme hot-reload** *(omarchy-branch-only)* -- `lua/plugins/theme.lua` is symlinked to Omarchy's active theme file. When Omarchy switches themes (Hyprland shortcut / `omarchy-theme-set`), it rewrites that file and fires `User LazyReload`, which `omarchy-theme-hotreload.lua` listens for: unloads the theme module, clears highlights, reloads the colorscheme plugin, re-sources `plugin/after/transparency.lua`, and redraws. No nvim restart, no manual `:colorscheme` call
 - **11 colorschemes** -- because choosing a theme is a form of self-expression (currently rotating through them like outfits)
 
 ## Dependencies
